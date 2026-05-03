@@ -134,6 +134,12 @@ func (c Config) validate() error {
 	if c.ServiceName == "" {
 		return errors.New("telemetry: ServiceName is required")
 	}
+	if c.Environment == "" {
+		// Required for Datadog Unified Service Tagging. Failing fast here
+		// prevents prod from silently shipping traces without the `env`
+		// tag, which would mix prod/staging/dev together in APM.
+		return errors.New("telemetry: Environment is required (e.g. \"production\", \"staging\", \"dev\")")
+	}
 	if c.OTLPEndpoint == "" {
 		return errors.New("telemetry: OTLPEndpoint is required")
 	}

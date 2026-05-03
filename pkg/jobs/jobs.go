@@ -21,6 +21,7 @@ import (
 	"context"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -66,27 +67,43 @@ func Inject(ctx context.Context) TraceCarrier {
 	}
 }
 
-// Extract restores the trace context and baggage carried by c onto a
-// fresh context derived from ctx. The returned SpanContext is the
-// original producer span — pass it to trace.WithLinks when starting a
-// worker span:
+// Extract restores baggage from the carrier onto ctx and returns the
+// producer's SpanContext separately for use with trace.WithLinks. The
+// returned ctx does NOT carry the producer span — callers must start
+// their worker span from a clean parentage so the worker becomes a new
+// trace root, linked (not parented) to the producer.
+//
+// Worker pattern:
 //
 //	ctx, parent := jobs.Extract(ctx, args.Trace)
 //	tracer := otel.Tracer("river-worker")
-//	var opts []trace.SpanStartOption
-//	opts = append(opts, trace.WithSpanKind(trace.SpanKindConsumer))
+//	opts := []trace.SpanStartOption{trace.WithSpanKind(trace.SpanKindConsumer)}
 //	if parent.IsValid() {
 //	    opts = append(opts, trace.WithLinks(trace.Link{SpanContext: parent}))
 //	}
 //	ctx, span := tracer.Start(ctx, "river.fulfill_item", opts...)
 //	defer span.End()
 //
-// When c is empty (e.g. a job enqueued before this plumbing existed),
-// Extract returns ctx unchanged and an invalid SpanContext.
+// Why detach: if the producer span stayed on ctx, tracer.Start would
+// make the worker span a CHILD of the producer rather than linking to
+// it. The resulting trace would span the entire queue lag (potentially
+// hours), distorting latency analysis.
+//
+// Baggage IS carried over: identity (user.id, tenant.id, etc.) flows
+// to the worker so logs and child spans remain attributable.
+//
+// When c is empty (a legacy job enqueued before this plumbing
+// existed), Extract returns ctx unchanged and an invalid SpanContext.
+//
+// When c carries baggage but no traceparent (or an unparseable one),
+// Extract still merges the baggage onto ctx and returns an invalid
+// SpanContext — the caller's pre-existing span on ctx is NEVER used
+// as the link target.
 func Extract(ctx context.Context, c TraceCarrier) (context.Context, trace.SpanContext) {
 	if c.IsZero() {
 		return ctx, trace.SpanContext{}
 	}
+
 	carrier := propagation.MapCarrier{}
 	if c.Traceparent != "" {
 		carrier["traceparent"] = c.Traceparent
@@ -97,6 +114,26 @@ func Extract(ctx context.Context, c TraceCarrier) (context.Context, trace.SpanCo
 	if c.Baggage != "" {
 		carrier["baggage"] = c.Baggage
 	}
-	ctx = otel.GetTextMapPropagator().Extract(ctx, carrier)
-	return ctx, trace.SpanContextFromContext(ctx)
+
+	// Extract from a clean Background ctx so the producer span and
+	// baggage are isolated from anything already on the caller's ctx.
+	clean := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
+
+	// Producer span comes ONLY from the carrier — never from caller's ctx.
+	parent := trace.SpanContextFromContext(clean)
+
+	// Merge baggage onto caller's ctx. Existing entries are preserved;
+	// carrier entries with the same key overwrite.
+	out := ctx
+	if b := baggage.FromContext(clean); b.Len() > 0 {
+		merged := baggage.FromContext(out)
+		for _, m := range b.Members() {
+			if next, err := merged.SetMember(m); err == nil {
+				merged = next
+			}
+		}
+		out = baggage.ContextWithBaggage(out, merged)
+	}
+
+	return out, parent
 }

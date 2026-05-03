@@ -23,6 +23,7 @@ func TestInit_DisabledIsNoop(t *testing.T) {
 func TestInit_EnabledRequiresServiceName(t *testing.T) {
 	_, err := telemetry.Init(context.Background(), telemetry.Config{
 		Enabled:      true,
+		Environment:  "test",
 		OTLPEndpoint: "localhost:4317",
 		Insecure:     true,
 	})
@@ -30,10 +31,25 @@ func TestInit_EnabledRequiresServiceName(t *testing.T) {
 	assert.Contains(t, err.Error(), "ServiceName")
 }
 
+func TestInit_EnabledRequiresEnvironment(t *testing.T) {
+	// Datadog Unified Service Tagging requires `env`. Without it, prod
+	// traces silently land in the same APM bucket as staging/dev, which
+	// is far worse than failing fast at startup.
+	_, err := telemetry.Init(context.Background(), telemetry.Config{
+		Enabled:      true,
+		ServiceName:  "test",
+		OTLPEndpoint: "localhost:4317",
+		Insecure:     true,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Environment")
+}
+
 func TestInit_EnabledRequiresOTLPEndpoint(t *testing.T) {
 	_, err := telemetry.Init(context.Background(), telemetry.Config{
 		Enabled:     true,
 		ServiceName: "test",
+		Environment: "test",
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "OTLPEndpoint")

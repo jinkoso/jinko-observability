@@ -82,10 +82,80 @@ func TestInject_TraceContextRoundTrip(t *testing.T) {
 	assert.Equal(t, originalSpanCtx.SpanID(), parent.SpanID(),
 		"the producer's span_id is the parent for the linked worker span")
 
-	// And the propagator put the span back in the restored ctx so further
-	// otel.SpanFromContext works downstream.
-	fromCtx := trace.SpanContextFromContext(restored)
-	assert.Equal(t, originalSpanCtx.TraceID(), fromCtx.TraceID())
+	// CRITICAL: the returned ctx MUST NOT carry the producer span. Otherwise
+	// tracer.Start would make the worker span a CHILD of the producer span,
+	// merging queue lag into the trace duration. Worker code must be free
+	// to start a fresh root span linked to the producer.
+	assert.False(t, trace.SpanContextFromContext(restored).IsValid(),
+		"Extract must NOT leave the producer span on the returned ctx")
+}
+
+// TestExtract_WorkerSpan_HasIndependentTrace is the load-bearing
+// regression test for the link-vs-child contract. It documents the
+// canonical worker pattern and asserts that the resulting worker span
+// is in its OWN trace, NOT a child of the producer trace.
+//
+// If this test ever flips, the entire "linked traces" UX in Datadog
+// APM breaks: workers running hours after their producer would appear
+// as one trace whose duration is the queue lag.
+func TestExtract_WorkerSpan_HasIndependentTrace(t *testing.T) {
+	tp := installPropagators(t)
+	tracer := tp.Tracer("jobs-test")
+
+	// 1. Producer side: start a span, inject into a carrier.
+	prodCtx, prodSpan := tracer.Start(context.Background(), "http.handler")
+	prodSpanCtx := prodSpan.SpanContext()
+	carrier := jobs.Inject(prodCtx)
+	prodSpan.End()
+
+	// 2. Worker side: extract, then run the documented WithLinks pattern.
+	workerInputCtx := context.Background() // worker starts with a clean ctx
+	workerCtx, parent := jobs.Extract(workerInputCtx, carrier)
+
+	require.True(t, parent.IsValid(), "carrier must yield a valid parent SpanContext")
+
+	opts := []trace.SpanStartOption{
+		trace.WithSpanKind(trace.SpanKindConsumer),
+	}
+	if parent.IsValid() {
+		opts = append(opts, trace.WithLinks(trace.Link{SpanContext: parent}))
+	}
+	_, workerSpan := tracer.Start(workerCtx, "river.fulfill_item", opts...)
+	defer workerSpan.End()
+
+	workerSpanCtx := workerSpan.SpanContext()
+
+	assert.NotEqual(t, prodSpanCtx.TraceID(), workerSpanCtx.TraceID(),
+		"worker span must be in a DIFFERENT trace from the producer "+
+			"(otherwise queue lag pollutes trace duration)")
+	assert.True(t, workerSpanCtx.IsValid(), "worker span context must be valid")
+}
+
+// TestExtract_BaggageOnlyCarrier_DoesNotPickUpCallerSpan asserts that
+// when the carrier has baggage but no traceparent (e.g. an unparseable
+// or missing one), Extract returns an invalid SpanContext rather than
+// silently latching onto whatever span happens to be on the caller's
+// ctx.
+//
+// Without this guarantee, a worker framework that wraps Work() with
+// its own span would have that span erroneously become the link target.
+func TestExtract_BaggageOnlyCarrier_DoesNotPickUpCallerSpan(t *testing.T) {
+	tp := installPropagators(t)
+	tracer := tp.Tracer("jobs-test")
+
+	// Caller's ctx has its own (unrelated) span — say, a worker-framework span.
+	callerCtx, framingSpan := tracer.Start(context.Background(), "river.framing")
+	defer framingSpan.End()
+
+	// Carrier has baggage but no traceparent.
+	carrier := jobs.TraceCarrier{
+		Baggage: conventions.BaggageUserID + "=u_x",
+	}
+
+	_, parent := jobs.Extract(callerCtx, carrier)
+	assert.False(t, parent.IsValid(),
+		"carrier without traceparent must yield invalid SpanContext, "+
+			"NOT the caller's pre-existing span")
 }
 
 func TestExtract_ZeroCarrier_LeavesContextUntouched(t *testing.T) {
@@ -102,6 +172,32 @@ func TestExtract_ZeroCarrier_LeavesContextUntouched(t *testing.T) {
 	assert.False(t, parent.IsValid())
 	assert.Equal(t, "yes", baggage.FromContext(ctxOut).Member("custom.flag").Value(),
 		"empty carrier must not clobber pre-existing baggage on ctx")
+}
+
+func TestExtract_PreservesCallerBaggage(t *testing.T) {
+	// When carrier has baggage AND caller already has different baggage,
+	// both must survive (caller's existing entries + carrier's new ones).
+	installPropagators(t)
+
+	preMember, err := baggage.NewMemberRaw("custom.flag", "yes")
+	require.NoError(t, err)
+	preBag, err := baggage.New(preMember)
+	require.NoError(t, err)
+	callerCtx := baggage.ContextWithBaggage(context.Background(), preBag)
+
+	// Producer-side baggage (only user.id):
+	prodCtx := telemetry.SetIdentity(context.Background(), telemetry.Identity{
+		UserID: "u_from_carrier",
+	})
+	carrier := jobs.Inject(prodCtx)
+
+	merged, _ := jobs.Extract(callerCtx, carrier)
+	mergedBag := baggage.FromContext(merged)
+
+	assert.Equal(t, "yes", mergedBag.Member("custom.flag").Value(),
+		"caller's pre-existing baggage must survive merge")
+	assert.Equal(t, "u_from_carrier", mergedBag.Member(conventions.BaggageUserID).Value(),
+		"carrier's baggage must be added on top")
 }
 
 func TestTraceCarrier_JSONShape(t *testing.T) {
