@@ -16,10 +16,20 @@ const (
 	HeaderSessionID    = "X-Session-ID"
 	HeaderLocale       = "X-Locale"
 	HeaderCountry      = "X-Country"
+	HeaderCity         = "X-City"
 	HeaderSource       = "X-Source"
 	HeaderPlatform     = "X-Platform"
 	HeaderJinkoCaller  = "X-Jinko-Caller"
 	HeaderClientIP     = "X-Real-IP"
 	HeaderForwardedFor = "X-Forwarded-For"
 	HeaderCFConnecting = "CF-Connecting-IP"
+
+	// Originating-client metadata (v0.3.0). Forwarded by jinko-mcp on
+	// behalf of the actual MCP client (chatgpt | claude | …). Distinct
+	// from HeaderJinkoCaller, which identifies the *internal service*
+	// making the call (mcp-bff, jinko-cli, …).
+	HeaderClientKind     = "X-Client-Kind"
+	HeaderClientVersion  = "X-Client-Version"
+	HeaderOrganizationID = "X-Organization-ID"
+	HeaderConversationID = "X-Conversation-ID"
 )
