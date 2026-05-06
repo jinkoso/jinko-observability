@@ -13,11 +13,14 @@ package conventions
 // Sabre, etc.). Use NewExternalClient (pkg/httpx) when calling third
 // parties to strip baggage at the trust boundary.
 const (
-	BaggageUserID       = "user.id"
-	BaggageTenantID     = "tenant.id"
-	BaggageSessionID    = "session.id"
-	BaggageMCPSessionID = "mcp.session.id"
-	BaggageRequestID    = "request.id"
+	BaggageUserID         = "user.id"
+	BaggageTenantID       = "tenant.id"
+	BaggageSessionID      = "session.id"
+	BaggageMCPSessionID   = "mcp.session.id"
+	BaggageRequestID      = "request.id"
+	BaggageClientKind     = "client.kind"
+	BaggageClientVersion  = "client.version"
+	BaggageOrganizationID = "organization.id"
 )
 
 // BaggageKeyPrefixes lists the namespaces the baggagecopy SpanProcessor
@@ -25,10 +28,17 @@ const (
 // transported via the baggage header but do not appear on spans.
 //
 // Add a prefix here only after weighing cardinality and PII risk.
+//
+// `client.` and `organization.` were added in v0.3.0 to attribute traffic
+// to the originating MCP client (chatgpt | claude | claude-code | …) and
+// the upstream org/tenant analog. Both have low cardinality (≤10 distinct
+// client kinds; org IDs are stable per integrator) and carry no PII.
 var BaggageKeyPrefixes = []string{
 	"user.",
 	"tenant.",
 	"session.",
 	"mcp.",
 	"request.",
+	"client.",
+	"organization.",
 }
