@@ -23,12 +23,12 @@ const (
 	BaggageOrganizationID = "organization.id"
 
 	// JIN-1176 identity-plane keys. Set at the auth trust boundary to
-	// attribute traffic to the org, the authentication method/key, and
-	// the resolved end user. Carry no PII (IDs only, not emails/names).
-	BaggageOrgID      = "org.id"
+	// attribute traffic to the authentication method / key / plane. The org
+	// is carried by the existing BaggageOrganizationID ("organization.id")
+	// and the acting end user by the existing BaggageUserID ("user.id") —
+	// there are no separate org.id / enduser.id keys. Carry no PII (IDs only).
 	BaggageAuthMethod = "auth.method"
 	BaggageAuthKeyID  = "auth.key_id"
-	BaggageEndUserID  = "enduser.id"
 	BaggageAuthPlane  = "auth.plane"
 )
 
@@ -43,9 +43,10 @@ const (
 // the upstream org/tenant analog. Both have low cardinality (≤10 distinct
 // client kinds; org IDs are stable per integrator) and carry no PII.
 //
-// `org.`, `auth.`, and `enduser.` were added for JIN-1176 to carry the
-// identity-plane attributes (org id, auth method/key id/plane, resolved
-// end-user id). All low cardinality and PII-free (IDs only).
+// `auth.` was added for JIN-1176 to carry the identity-plane auth attributes
+// (auth method / key id / plane). The org is already promoted via
+// `organization.` and the acting end user via `user.` — there are no separate
+// `org.` / `enduser.` prefixes. All low cardinality and PII-free (IDs only).
 var BaggageKeyPrefixes = []string{
 	"user.",
 	"tenant.",
@@ -54,7 +55,5 @@ var BaggageKeyPrefixes = []string{
 	"request.",
 	"client.",
 	"organization.",
-	"org.",
 	"auth.",
-	"enduser.",
 }
