@@ -21,6 +21,15 @@ const (
 	BaggageClientKind     = "client.kind"
 	BaggageClientVersion  = "client.version"
 	BaggageOrganizationID = "organization.id"
+
+	// JIN-1176 identity-plane keys. Set at the auth trust boundary to
+	// attribute traffic to the org, the authentication method/key, and
+	// the resolved end user. Carry no PII (IDs only, not emails/names).
+	BaggageOrgID      = "org.id"
+	BaggageAuthMethod = "auth.method"
+	BaggageAuthKeyID  = "auth.key_id"
+	BaggageEndUserID  = "enduser.id"
+	BaggageAuthPlane  = "auth.plane"
 )
 
 // BaggageKeyPrefixes lists the namespaces the baggagecopy SpanProcessor
@@ -33,6 +42,10 @@ const (
 // to the originating MCP client (chatgpt | claude | claude-code | …) and
 // the upstream org/tenant analog. Both have low cardinality (≤10 distinct
 // client kinds; org IDs are stable per integrator) and carry no PII.
+//
+// `org.`, `auth.`, and `enduser.` were added for JIN-1176 to carry the
+// identity-plane attributes (org id, auth method/key id/plane, resolved
+// end-user id). All low cardinality and PII-free (IDs only).
 var BaggageKeyPrefixes = []string{
 	"user.",
 	"tenant.",
@@ -41,4 +54,7 @@ var BaggageKeyPrefixes = []string{
 	"request.",
 	"client.",
 	"organization.",
+	"org.",
+	"auth.",
+	"enduser.",
 }

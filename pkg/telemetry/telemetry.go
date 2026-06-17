@@ -84,9 +84,23 @@ type Shutdown func(context.Context) error
 // Init configures the global OTel SDK. It returns a Shutdown function
 // that the caller must defer.
 //
-// When cfg.Enabled is false, Init returns a no-op Shutdown and does
-// not modify any global state — the program runs without telemetry.
+// The global composite TextMapPropagator (W3C trace context + W3C
+// baggage) is registered UNCONDITIONALLY — even when cfg.Enabled is
+// false. A disabled service still participates in cross-service tracing
+// context: it must propagate the incoming traceparent and baggage to
+// its downstream calls so traces aren't broken at the boundary. Only the
+// exporter, TracerProvider, and sampler are gated on Enabled.
+//
+// When cfg.Enabled is false, Init returns a no-op Shutdown and does not
+// install a TracerProvider — the program runs without exporting spans.
 func Init(ctx context.Context, cfg Config) (Shutdown, error) {
+	// Register the propagator regardless of Enabled so disabled services
+	// still inject/extract traceparent + baggage on their HTTP calls.
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{}, // traceparent + tracestate
+		propagation.Baggage{},      // W3C baggage
+	))
+
 	if !cfg.Enabled {
 		return noopShutdown, nil
 	}
@@ -121,11 +135,6 @@ func Init(ctx context.Context, cfg Config) (Shutdown, error) {
 		sdktrace.WithBatcher(exp),
 	)
 	otel.SetTracerProvider(tp)
-
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{}, // traceparent + tracestate
-		propagation.Baggage{},      // W3C baggage
-	))
 
 	return tp.Shutdown, nil
 }
