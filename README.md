@@ -17,7 +17,7 @@ Consumed by `jinko-connector` and `jinko-mcp-bff` (and any future Go service). O
 
 **Stability**: v0.2.x is marked Experimental. APIs may change without notice during the v0.2.x line. Pin to a tagged release.
 
-**v0.5.0 (unreleased)**: `pkg/conventions` exports the canonical Datadog `env` vocabulary (`dev` / `sandbox` / `preprod` / `prod`) plus `IsCanonicalEnvironment`, and `telemetry.Init` now rejects any other `Environment` value (JIN-1570). Services still passing `production`, `prod-us`, or `staging` fail at startup and must switch to a canonical value.
+**v0.5.0 (unreleased)**: `pkg/conventions` exports the canonical Datadog `env` vocabulary (`dev` / `sandbox` / `preprod` / `prod`) plus `IsCanonicalEnvironment`, and `telemetry.Init` now rejects any other `Environment` value when `Enabled` is true (a disabled config is not validated) (JIN-1570). Services still passing `production`, `prod-us`, or `staging` with telemetry enabled fail at startup and must switch to a canonical value. The check covers the merged resource, so `ExtraResourceAttributes` cannot override `deployment.environment` or `env` with a non-canonical value either.
 
 ## Quick start
 
@@ -119,10 +119,18 @@ The Datadog `env` tag has exactly four legal values across the estate:
 
 Region, cluster, and cell go in the host/cluster tags — never in `env`. A value like `prod-us` splits one logical environment across two APM buckets and breaks every cross-service query, dashboard, and monitor that groups by env.
 
-`telemetry.Init` validates `Config.Environment` against this set and returns an error for anything else, so a misconfigured service fails at startup instead of shipping traces nobody queries:
+When `Enabled` is true, `telemetry.Init` validates `Config.Environment` against this set and returns an error for anything else, so a misconfigured service fails at startup instead of shipping traces nobody queries (a disabled config is a no-op and is not validated — it exports no spans, so it has no `env` tag to get wrong):
 
 ```
 telemetry: Environment "prod-us" is not canonical; use one of dev, sandbox, preprod, prod (JIN-1570)
+```
+
+`ExtraResourceAttributes` is appended after the defaults, so it could otherwise
+overwrite the env tag after that check had passed. The merged resource is
+re-checked for the same reason:
+
+```
+telemetry: resource deployment.environment "production" is not canonical; use one of dev, sandbox, preprod, prod, and set it through Config.Environment rather than ExtraResourceAttributes (JIN-1570)
 ```
 
 The values are exported as constants for use in service config code:

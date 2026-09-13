@@ -27,6 +27,7 @@ import (
 
 	"go.opentelemetry.io/contrib/processors/baggagecopy"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
@@ -77,6 +78,12 @@ type Config struct {
 	// Resource attributes appended on top of the defaults built from
 	// ServiceName/ServiceVersion/Environment. Use for service.namespace,
 	// host.name, etc.
+	//
+	// These are appended LAST, so they override the defaults — with one
+	// exception: deployment.environment and env stay under the canonical
+	// vocabulary check (JIN-1570). buildResource re-checks the merged
+	// resource and fails, rather than let an override slip a value past
+	// validate. Setting the environment belongs in Environment above.
 	ExtraResourceAttributes []sdkresource.Option
 }
 
@@ -185,7 +192,49 @@ func buildResource(ctx context.Context, cfg Config) (*sdkresource.Resource, erro
 	}
 	attrs = append(attrs, cfg.ExtraResourceAttributes...)
 
-	return sdkresource.New(ctx, attrs...)
+	res, err := sdkresource.New(ctx, attrs...)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateResourceEnvironment(res); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// environmentResourceKeys are the resource attributes that become the Datadog
+// `env` tag: the OTel semantic-convention key, and the literal key Datadog
+// Unified Service Tagging reads when a caller sets it directly.
+var environmentResourceKeys = map[attribute.Key]bool{
+	semconv.DeploymentEnvironmentKey: true,
+	attribute.Key("env"):             true,
+}
+
+// validateResourceEnvironment re-applies the canonical-vocabulary check to the
+// MERGED resource. Config.validate only sees cfg.Environment, but
+// ExtraResourceAttributes are appended after deployment.environment in
+// buildResource, so a caller could overwrite the env tag with "production" or
+// "prod-us" and ship spans under an env no dashboard or monitor queries —
+// exactly what validate exists to prevent (JIN-1570).
+//
+// An empty value is skipped: that means no env tag was set at all, which
+// Config.validate already refuses before buildResource is reached.
+func validateResourceEnvironment(res *sdkresource.Resource) error {
+	if res == nil {
+		return nil
+	}
+	for _, kv := range res.Attributes() {
+		if !environmentResourceKeys[kv.Key] {
+			continue
+		}
+		value := kv.Value.Emit()
+		if value == "" || conventions.IsCanonicalEnvironment(value) {
+			continue
+		}
+		return fmt.Errorf("telemetry: resource %s %q is not canonical; use one of %s, and set it through Config.Environment rather than ExtraResourceAttributes (JIN-1570)",
+			kv.Key, value, strings.Join(conventions.Environments, ", "))
+	}
+	return nil
 }
 
 func buildTraceExporter(ctx context.Context, cfg Config) (sdktrace.SpanExporter, error) {

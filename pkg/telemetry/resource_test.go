@@ -1,0 +1,132 @@
+package telemetry
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/jinkoso/jinko-observability/pkg/conventions"
+
+	"go.opentelemetry.io/otel/attribute"
+	sdkresource "go.opentelemetry.io/otel/sdk/resource"
+)
+
+// resourceAttr returns the value of key in res, and whether it is set.
+func resourceAttr(res *sdkresource.Resource, key attribute.Key) (string, bool) {
+	for _, kv := range res.Attributes() {
+		if kv.Key == key {
+			return kv.Value.Emit(), true
+		}
+	}
+	return "", false
+}
+
+// JIN-1570: Config.validate checks cfg.Environment, but buildResource appends
+// ExtraResourceAttributes AFTER deployment.environment — so a caller could set
+// a canonical Environment, pass validate, and then overwrite the env tag with
+// "production" on the resource that actually ships. The merged resource is
+// re-checked, so the override is refused instead.
+//
+// Pure buildResource test: no exporter, no global TracerProvider.
+func TestBuildResource_RejectsNonCanonicalEnvFromExtraResourceAttributes(t *testing.T) {
+	cases := []struct {
+		name      string
+		extra     sdkresource.Option
+		offending string
+	}{
+		{
+			name:      "deployment.environment override",
+			extra:     sdkresource.WithAttributes(attribute.String("deployment.environment", "production")),
+			offending: "production",
+		},
+		{
+			name:      "region-qualified value",
+			extra:     sdkresource.WithAttributes(attribute.String("deployment.environment", "prod-us")),
+			offending: "prod-us",
+		},
+		{
+			name:      "datadog env tag set directly",
+			extra:     sdkresource.WithAttributes(attribute.String("env", "staging")),
+			offending: "staging",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := buildResource(context.Background(), Config{
+				ServiceName:             "test",
+				Environment:             conventions.EnvDev, // canonical: only the override is wrong
+				ExtraResourceAttributes: []sdkresource.Option{tc.extra},
+			})
+			if err == nil {
+				t.Fatalf("a non-canonical env via %s must be refused, got nil error", tc.name)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "not canonical") {
+				t.Errorf("error must say the value is not canonical; got: %v", err)
+			}
+			if !strings.Contains(msg, tc.offending) {
+				t.Errorf("error must name the offending value %q; got: %v", tc.offending, err)
+			}
+			if !strings.Contains(msg, strings.Join(conventions.Environments, ", ")) {
+				t.Errorf("error must list the canonical vocabulary; got: %v", err)
+			}
+		})
+	}
+}
+
+// The check is a vocabulary check, not a ban on the attribute: moving the
+// resource between canonical environments still works and still wins over
+// cfg.Environment.
+func TestBuildResource_AcceptsCanonicalEnvFromExtraResourceAttributes(t *testing.T) {
+	res, err := buildResource(context.Background(), Config{
+		ServiceName: "test",
+		Environment: conventions.EnvDev,
+		ExtraResourceAttributes: []sdkresource.Option{
+			sdkresource.WithAttributes(
+				attribute.String("deployment.environment", conventions.EnvPreprod),
+				attribute.String("service.namespace", "jinko"),
+			),
+		},
+	})
+	if err != nil {
+		t.Fatalf("a canonical override must be accepted, got: %v", err)
+	}
+	if got, _ := resourceAttr(res, "deployment.environment"); got != conventions.EnvPreprod {
+		t.Errorf("deployment.environment = %q, want %q — ExtraResourceAttributes must still win", got, conventions.EnvPreprod)
+	}
+	if got, ok := resourceAttr(res, "service.namespace"); !ok || got != "jinko" {
+		t.Errorf("service.namespace = %q (set=%v), want %q — unrelated overrides must be untouched", got, ok, "jinko")
+	}
+}
+
+// The default path: env tag straight from the validated Config.
+func TestBuildResource_CanonicalConfigEnvironment(t *testing.T) {
+	for _, env := range conventions.Environments {
+		t.Run(env, func(t *testing.T) {
+			res, err := buildResource(context.Background(), Config{
+				ServiceName: "test",
+				Environment: env,
+			})
+			if err != nil {
+				t.Fatalf("canonical environment %q must be accepted, got: %v", env, err)
+			}
+			if got, _ := resourceAttr(res, "deployment.environment"); got != env {
+				t.Errorf("deployment.environment = %q, want %q", got, env)
+			}
+		})
+	}
+}
+
+// A Config with no Environment reaches buildResource only in tests —
+// Config.validate refuses it first. buildResource must not double-report it as
+// a non-canonical resource attribute, because the attribute is never written.
+func TestBuildResource_NoEnvironmentIsNotReportedHere(t *testing.T) {
+	res, err := buildResource(context.Background(), Config{ServiceName: "test"})
+	if err != nil {
+		t.Fatalf("buildResource must leave the empty-Environment case to Config.validate, got: %v", err)
+	}
+	if got, ok := resourceAttr(res, "deployment.environment"); ok {
+		t.Errorf("deployment.environment = %q, want it absent", got)
+	}
+}
