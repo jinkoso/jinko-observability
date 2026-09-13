@@ -203,11 +203,19 @@ func buildResource(ctx context.Context, cfg Config) (*sdkresource.Resource, erro
 }
 
 // environmentResourceKeys are the resource attributes that become the Datadog
-// `env` tag: the OTel semantic-convention key, and the literal key Datadog
-// Unified Service Tagging reads when a caller sets it directly.
+// `env` tag: the OTel semantic-convention key, its newer spelling, and the
+// literal key Datadog Unified Service Tagging reads when a caller sets it
+// directly.
+//
+// deployment.environment.name is the semconv >= v1.27 rename of
+// deployment.environment. This module pins v1.26.0, so buildResource never
+// writes it, but the Datadog OTLP intake maps it onto the same `env` tag —
+// a caller can retag the resource through it just as effectively, so the
+// check must not be one attribute rename away from being bypassed.
 var environmentResourceKeys = map[attribute.Key]bool{
-	semconv.DeploymentEnvironmentKey: true,
-	attribute.Key("env"):             true,
+	semconv.DeploymentEnvironmentKey:             true,
+	attribute.Key("deployment.environment.name"): true,
+	attribute.Key("env"):                         true,
 }
 
 // validateResourceEnvironment re-applies the canonical-vocabulary check to the
@@ -217,8 +225,14 @@ var environmentResourceKeys = map[attribute.Key]bool{
 // "prod-us" and ship spans under an env no dashboard or monitor queries —
 // exactly what validate exists to prevent (JIN-1570).
 //
-// An empty value is skipped: that means no env tag was set at all, which
-// Config.validate already refuses before buildResource is reached.
+// An empty value is refused like any other non-canonical one. Skipping it
+// would reopen the same hole from the other side: ExtraResourceAttributes are
+// appended after deployment.environment, so deployment.environment="" does not
+// leave the attribute absent — it overwrites the validated value, shipping
+// spans tagged env:"" . Config.validate refuses the empty string for the same
+// reason. An attribute nobody set is absent from the merged resource, so this
+// loop never sees it and never reports it — buildResource writes
+// deployment.environment only when cfg.Environment is non-empty.
 func validateResourceEnvironment(res *sdkresource.Resource) error {
 	if res == nil {
 		return nil
@@ -228,7 +242,7 @@ func validateResourceEnvironment(res *sdkresource.Resource) error {
 			continue
 		}
 		value := kv.Value.Emit()
-		if value == "" || conventions.IsCanonicalEnvironment(value) {
+		if conventions.IsCanonicalEnvironment(value) {
 			continue
 		}
 		return fmt.Errorf("telemetry: resource %s %q is not canonical; use one of %s, and set it through Config.Environment rather than ExtraResourceAttributes (JIN-1570)",

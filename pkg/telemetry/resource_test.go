@@ -130,3 +130,100 @@ func TestBuildResource_NoEnvironmentIsNotReportedHere(t *testing.T) {
 		t.Errorf("deployment.environment = %q, want it absent", got)
 	}
 }
+
+// deploymentEnvironmentNameKey is the newer OTel semantic-convention spelling
+// of the env attribute (semconv >= v1.27). This module pins v1.26.0, which has
+// no constant for it, but the Datadog OTLP intake maps it onto the same `env`
+// tag — so a caller can retag a resource through it just as effectively as
+// through deployment.environment, and the merged-resource check must cover it.
+const deploymentEnvironmentNameKey = attribute.Key("deployment.environment.name")
+
+// JIN-1570 (Codex follow-up): validateResourceEnvironment used to `continue`
+// on an empty value, on the reasoning that an absent env tag is
+// Config.validate's problem. But ExtraResourceAttributes are appended AFTER
+// deployment.environment, so deployment.environment="" does not leave the
+// attribute absent — it overwrites the validated value with an empty string,
+// and the skip let that through. The resource then ships spans tagged env:"" ,
+// which is exactly what Config.validate refuses before buildResource is
+// reached.
+func TestBuildResource_RejectsEmptyEnvFromExtraResourceAttributes(t *testing.T) {
+	cases := []struct {
+		name string
+		key  attribute.Key
+	}{
+		{"deployment.environment blanked", "deployment.environment"},
+		{"datadog env tag blanked", "env"},
+		{"newer semconv key blanked", deploymentEnvironmentNameKey},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := buildResource(context.Background(), Config{
+				ServiceName: "test",
+				Environment: conventions.EnvDev, // canonical: only the override is wrong
+				ExtraResourceAttributes: []sdkresource.Option{
+					sdkresource.WithAttributes(attribute.String(string(tc.key), "")),
+				},
+			})
+			if err == nil {
+				t.Fatalf("%s blanks the env tag and must be refused, got nil error", tc.key)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, string(tc.key)+` ""`) {
+				t.Errorf("error must name the blanked attribute %s and show its empty value; got: %v", tc.key, err)
+			}
+			if !strings.Contains(msg, "not canonical") {
+				t.Errorf("error must say the value is not canonical; got: %v", err)
+			}
+		})
+	}
+}
+
+// The newer semconv spelling is a second door onto the same Datadog `env`
+// tag, so a non-canonical value through it is refused exactly like the v1.26
+// key — otherwise the check is one attribute rename away from being bypassed.
+func TestBuildResource_RejectsNonCanonicalDeploymentEnvironmentName(t *testing.T) {
+	for _, offending := range []string{"production", "prod-us", "staging"} {
+		t.Run(offending, func(t *testing.T) {
+			_, err := buildResource(context.Background(), Config{
+				ServiceName: "test",
+				Environment: conventions.EnvDev,
+				ExtraResourceAttributes: []sdkresource.Option{
+					sdkresource.WithAttributes(
+						attribute.String(string(deploymentEnvironmentNameKey), offending),
+					),
+				},
+			})
+			if err == nil {
+				t.Fatalf("deployment.environment.name=%s must be refused, got nil error", offending)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, offending) {
+				t.Errorf("error must name the offending value %q; got: %v", offending, err)
+			}
+			if !strings.Contains(msg, string(deploymentEnvironmentNameKey)) {
+				t.Errorf("error must name the attribute it refused; got: %v", err)
+			}
+		})
+	}
+}
+
+// Same vocabulary check, not a ban: the newer key carrying a canonical value
+// is accepted and lands on the merged resource.
+func TestBuildResource_AcceptsCanonicalDeploymentEnvironmentName(t *testing.T) {
+	res, err := buildResource(context.Background(), Config{
+		ServiceName: "test",
+		Environment: conventions.EnvDev,
+		ExtraResourceAttributes: []sdkresource.Option{
+			sdkresource.WithAttributes(
+				attribute.String(string(deploymentEnvironmentNameKey), conventions.EnvPreprod),
+			),
+		},
+	})
+	if err != nil {
+		t.Fatalf("a canonical deployment.environment.name must be accepted, got: %v", err)
+	}
+	if got, ok := resourceAttr(res, deploymentEnvironmentNameKey); !ok || got != conventions.EnvPreprod {
+		t.Errorf("deployment.environment.name = %q (set=%v), want %q", got, ok, conventions.EnvPreprod)
+	}
+}
