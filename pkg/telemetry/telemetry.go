@@ -46,6 +46,9 @@ type Config struct {
 	ServiceVersion string
 
 	// Environment populates OTel deployment.environment and Datadog "env".
+	// Must be one of the canonical values in conventions.Environments —
+	// "dev", "sandbox", "preprod", "prod" (JIN-1570). Region and cluster
+	// belong in host/cluster tags, not here.
 	Environment string
 
 	// OTLPEndpoint is the gRPC endpoint of the Datadog Agent OTLP receiver
@@ -146,8 +149,17 @@ func (c Config) validate() error {
 	if c.Environment == "" {
 		// Required for Datadog Unified Service Tagging. Failing fast here
 		// prevents prod from silently shipping traces without the `env`
-		// tag, which would mix prod/staging/dev together in APM.
-		return errors.New("telemetry: Environment is required (e.g. \"production\", \"staging\", \"dev\")")
+		// tag, which would mix prod/preprod/dev together in APM.
+		return fmt.Errorf("telemetry: Environment is required (one of %s)",
+			strings.Join(conventions.Environments, ", "))
+	}
+	if !conventions.IsCanonicalEnvironment(c.Environment) {
+		// A non-canonical value is worse than a missing one: the service ships
+		// traces under an env nobody queries ("production", "prod-us"), so its
+		// spans are absent from every estate-wide dashboard and monitor while
+		// looking perfectly healthy locally.
+		return fmt.Errorf("telemetry: Environment %q is not canonical; use one of %s (JIN-1570)",
+			c.Environment, strings.Join(conventions.Environments, ", "))
 	}
 	if c.OTLPEndpoint == "" {
 		return errors.New("telemetry: OTLPEndpoint is required")

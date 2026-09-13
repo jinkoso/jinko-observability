@@ -17,6 +17,8 @@ Consumed by `jinko-connector` and `jinko-mcp-bff` (and any future Go service). O
 
 **Stability**: v0.2.x is marked Experimental. APIs may change without notice during the v0.2.x line. Pin to a tagged release.
 
+**v0.5.0 (unreleased)**: `pkg/conventions` exports the canonical Datadog `env` vocabulary (`dev` / `sandbox` / `preprod` / `prod`) plus `IsCanonicalEnvironment`, and `telemetry.Init` now rejects any other `Environment` value (JIN-1570). Services still passing `production`, `prod-us`, or `staging` fail at startup and must switch to a canonical value.
+
 ## Quick start
 
 A minimal Gin service wired for full Jinko-standard observability:
@@ -41,7 +43,7 @@ func main() {
     shutdown, err := telemetry.Init(ctx, telemetry.Config{
         ServiceName:    "my-service",
         ServiceVersion: "1.0.0",
-        Environment:    "production",
+        Environment:    "prod", // dev | sandbox | preprod | prod
         OTLPEndpoint:   "datadog-agent:4317",
         Insecure:       true,
         Enabled:        true,
@@ -103,6 +105,39 @@ if parent.IsValid() {
 ctx, span := tracer.Start(ctx, "fulfill_item", opts...)
 defer span.End()
 ```
+
+## Environment vocabulary
+
+The Datadog `env` tag has exactly four legal values across the estate:
+
+| Value | Deployment |
+|---|---|
+| `dev` | Development environment |
+| `sandbox` | Customer-facing sandbox |
+| `preprod` | Pre-production |
+| `prod` | Production (all regions) |
+
+Region, cluster, and cell go in the host/cluster tags — never in `env`. A value like `prod-us` splits one logical environment across two APM buckets and breaks every cross-service query, dashboard, and monitor that groups by env.
+
+`telemetry.Init` validates `Config.Environment` against this set and returns an error for anything else, so a misconfigured service fails at startup instead of shipping traces nobody queries:
+
+```
+telemetry: Environment "prod-us" is not canonical; use one of dev, sandbox, preprod, prod (JIN-1570)
+```
+
+The values are exported as constants for use in service config code:
+
+```go
+conventions.EnvDev      // "dev"
+conventions.EnvSandbox  // "sandbox"
+conventions.EnvPreprod  // "preprod"
+conventions.EnvProd     // "prod"
+
+conventions.Environments                    // []string{"dev", "sandbox", "preprod", "prod"}
+conventions.IsCanonicalEnvironment("staging") // false
+```
+
+Matching is exact — no case folding, no whitespace trimming. `Prod` and `prod ` are rejected.
 
 ## Sampling
 
