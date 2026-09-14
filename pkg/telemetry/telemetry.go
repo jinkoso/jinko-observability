@@ -196,7 +196,7 @@ func buildResource(ctx context.Context, cfg Config) (*sdkresource.Resource, erro
 	if err != nil {
 		return nil, err
 	}
-	if err := validateResourceEnvironment(res); err != nil {
+	if err := validateResourceEnvironment(res, cfg.Environment); err != nil {
 		return nil, err
 	}
 	return res, nil
@@ -218,22 +218,30 @@ var environmentResourceKeys = map[attribute.Key]bool{
 	attribute.Key("env"):                         true,
 }
 
-// validateResourceEnvironment re-applies the canonical-vocabulary check to the
-// MERGED resource. Config.validate only sees cfg.Environment, but
-// ExtraResourceAttributes are appended after deployment.environment in
-// buildResource, so a caller could overwrite the env tag with "production" or
-// "prod-us" and ship spans under an env no dashboard or monitor queries —
-// exactly what validate exists to prevent (JIN-1570).
+// validateResourceEnvironment re-applies the env check to the MERGED resource,
+// against the env the service was actually configured with. Config.validate
+// only sees cfg.Environment, but ExtraResourceAttributes are appended after
+// deployment.environment in buildResource, so a caller could overwrite the env
+// tag on the resource that actually ships (JIN-1570).
 //
-// An empty value is refused like any other non-canonical one. Skipping it
-// would reopen the same hole from the other side: ExtraResourceAttributes are
+// Every environment attribute on the merged resource must EQUAL configured.
+// Canonical membership alone is not enough: a prod service whose override says
+// env="dev" is still canonical, yet its spans land under an env nobody queries
+// for prod, and the merged resource can contradict itself
+// (deployment.environment="prod" beside env="dev"). Both checks are kept — the
+// vocabulary one reports the estate-wide mistake ("production", "prod-us") with
+// the list of allowed values, and it also covers the case where configured
+// itself is off-vocabulary because the caller skipped Config.validate.
+//
+// An empty value is refused like any other disagreeing one. Skipping it would
+// reopen the same hole from the other side: ExtraResourceAttributes are
 // appended after deployment.environment, so deployment.environment="" does not
 // leave the attribute absent — it overwrites the validated value, shipping
 // spans tagged env:"" . Config.validate refuses the empty string for the same
 // reason. An attribute nobody set is absent from the merged resource, so this
 // loop never sees it and never reports it — buildResource writes
 // deployment.environment only when cfg.Environment is non-empty.
-func validateResourceEnvironment(res *sdkresource.Resource) error {
+func validateResourceEnvironment(res *sdkresource.Resource, configured string) error {
 	if res == nil {
 		return nil
 	}
@@ -242,11 +250,14 @@ func validateResourceEnvironment(res *sdkresource.Resource) error {
 			continue
 		}
 		value := kv.Value.Emit()
-		if conventions.IsCanonicalEnvironment(value) {
-			continue
+		if !conventions.IsCanonicalEnvironment(value) {
+			return fmt.Errorf("telemetry: resource %s %q is not canonical; use one of %s, and set it through Config.Environment rather than ExtraResourceAttributes (JIN-1570)",
+				kv.Key, value, strings.Join(conventions.Environments, ", "))
 		}
-		return fmt.Errorf("telemetry: resource %s %q is not canonical; use one of %s, and set it through Config.Environment rather than ExtraResourceAttributes (JIN-1570)",
-			kv.Key, value, strings.Join(conventions.Environments, ", "))
+		if value != configured {
+			return fmt.Errorf("telemetry: resource %s %q disagrees with Config.Environment %q; every environment attribute on the merged resource must carry the configured env — set it through Config.Environment rather than ExtraResourceAttributes (JIN-1570)",
+				kv.Key, value, configured)
+		}
 	}
 	return nil
 }

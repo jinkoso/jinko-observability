@@ -75,31 +75,6 @@ func TestBuildResource_RejectsNonCanonicalEnvFromExtraResourceAttributes(t *test
 	}
 }
 
-// The check is a vocabulary check, not a ban on the attribute: moving the
-// resource between canonical environments still works and still wins over
-// cfg.Environment.
-func TestBuildResource_AcceptsCanonicalEnvFromExtraResourceAttributes(t *testing.T) {
-	res, err := buildResource(context.Background(), Config{
-		ServiceName: "test",
-		Environment: conventions.EnvDev,
-		ExtraResourceAttributes: []sdkresource.Option{
-			sdkresource.WithAttributes(
-				attribute.String("deployment.environment", conventions.EnvPreprod),
-				attribute.String("service.namespace", "jinko"),
-			),
-		},
-	})
-	if err != nil {
-		t.Fatalf("a canonical override must be accepted, got: %v", err)
-	}
-	if got, _ := resourceAttr(res, "deployment.environment"); got != conventions.EnvPreprod {
-		t.Errorf("deployment.environment = %q, want %q — ExtraResourceAttributes must still win", got, conventions.EnvPreprod)
-	}
-	if got, ok := resourceAttr(res, "service.namespace"); !ok || got != "jinko" {
-		t.Errorf("service.namespace = %q (set=%v), want %q — unrelated overrides must be untouched", got, ok, "jinko")
-	}
-}
-
 // The default path: env tag straight from the validated Config.
 func TestBuildResource_CanonicalConfigEnvironment(t *testing.T) {
 	for _, env := range conventions.Environments {
@@ -208,22 +183,78 @@ func TestBuildResource_RejectsNonCanonicalDeploymentEnvironmentName(t *testing.T
 	}
 }
 
-// Same vocabulary check, not a ban: the newer key carrying a canonical value
-// is accepted and lands on the merged resource.
-func TestBuildResource_AcceptsCanonicalDeploymentEnvironmentName(t *testing.T) {
+// JIN-1570 (Codex follow-up): membership in the canonical vocabulary is not
+// enough — the value has to be THE configured one. A prod caller with
+// Environment: "prod" and an ExtraResourceAttributes override of env="dev"
+// passed the vocabulary check, because "dev" is canonical, and then shipped
+// production spans under env:dev. The merged resource can also end up
+// self-contradictory (deployment.environment="prod" next to env="dev"), which
+// is the same mis-tagging the check exists to prevent.
+func TestBuildResource_RejectsCanonicalEnvThatDisagreesWithConfig(t *testing.T) {
+	const configured = conventions.EnvProd
+
+	cases := []struct {
+		name     string
+		key      attribute.Key
+		override string
+	}{
+		{"datadog env tag disagrees", "env", conventions.EnvDev},
+		{"deployment.environment disagrees", "deployment.environment", conventions.EnvSandbox},
+		{"newer semconv key disagrees", deploymentEnvironmentNameKey, conventions.EnvPreprod},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := buildResource(context.Background(), Config{
+				ServiceName: "test",
+				Environment: configured,
+				ExtraResourceAttributes: []sdkresource.Option{
+					sdkresource.WithAttributes(attribute.String(string(tc.key), tc.override)),
+				},
+			})
+			if err == nil {
+				t.Fatalf("%s=%q contradicts Config.Environment %q and must be refused, got nil error",
+					tc.key, tc.override, configured)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, string(tc.key)) {
+				t.Errorf("error must name the attribute it refused (%s); got: %v", tc.key, err)
+			}
+			if !strings.Contains(msg, `"`+tc.override+`"`) {
+				t.Errorf("error must name the overriding value %q; got: %v", tc.override, err)
+			}
+			if !strings.Contains(msg, `"`+configured+`"`) {
+				t.Errorf("error must name the configured value %q so both sides of the disagreement are visible; got: %v", configured, err)
+			}
+		})
+	}
+}
+
+// The rule is agreement, not a ban: an override that restates the configured
+// env is accepted and lands on the merged resource, and unrelated overrides
+// are untouched.
+func TestBuildResource_AcceptsEnvOverrideThatAgreesWithConfig(t *testing.T) {
 	res, err := buildResource(context.Background(), Config{
 		ServiceName: "test",
-		Environment: conventions.EnvDev,
+		Environment: conventions.EnvPreprod,
 		ExtraResourceAttributes: []sdkresource.Option{
 			sdkresource.WithAttributes(
+				attribute.String("deployment.environment", conventions.EnvPreprod),
 				attribute.String(string(deploymentEnvironmentNameKey), conventions.EnvPreprod),
+				attribute.String("env", conventions.EnvPreprod),
+				attribute.String("service.namespace", "jinko"),
 			),
 		},
 	})
 	if err != nil {
-		t.Fatalf("a canonical deployment.environment.name must be accepted, got: %v", err)
+		t.Fatalf("env attributes that agree with Config.Environment must be accepted, got: %v", err)
 	}
-	if got, ok := resourceAttr(res, deploymentEnvironmentNameKey); !ok || got != conventions.EnvPreprod {
-		t.Errorf("deployment.environment.name = %q (set=%v), want %q", got, ok, conventions.EnvPreprod)
+	for _, key := range []attribute.Key{"deployment.environment", deploymentEnvironmentNameKey, "env"} {
+		if got, ok := resourceAttr(res, key); !ok || got != conventions.EnvPreprod {
+			t.Errorf("%s = %q (set=%v), want %q", key, got, ok, conventions.EnvPreprod)
+		}
+	}
+	if got, ok := resourceAttr(res, "service.namespace"); !ok || got != "jinko" {
+		t.Errorf("service.namespace = %q (set=%v), want %q — unrelated overrides must be untouched", got, ok, "jinko")
 	}
 }

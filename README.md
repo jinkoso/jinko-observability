@@ -17,7 +17,7 @@ Consumed by `jinko-connector` and `jinko-mcp-bff` (and any future Go service). O
 
 **Stability**: v0.2.x is marked Experimental. APIs may change without notice during the v0.2.x line. Pin to a tagged release.
 
-**v0.5.0 (unreleased)**: `pkg/conventions` exports the canonical Datadog `env` vocabulary (`dev` / `sandbox` / `preprod` / `prod`) plus `IsCanonicalEnvironment`, and `telemetry.Init` now rejects any other `Environment` value when `Enabled` is true (a disabled config is not validated) (JIN-1570). Services still passing `production`, `prod-us`, or `staging` with telemetry enabled fail at startup and must switch to a canonical value. The check covers the merged resource, so `ExtraResourceAttributes` cannot override `deployment.environment` or `env` with a non-canonical value either.
+**v0.5.0 (unreleased)**: `pkg/conventions` exports the canonical Datadog `env` vocabulary (`dev` / `sandbox` / `preprod` / `prod`) plus `IsCanonicalEnvironment`, and `telemetry.Init` now rejects any other `Environment` value when `Enabled` is true (a disabled config is not validated) (JIN-1570). Services still passing `production`, `prod-us`, or `staging` with telemetry enabled fail at startup and must switch to a canonical value. The check covers the merged resource, so `ExtraResourceAttributes` cannot retag `deployment.environment`, `deployment.environment.name`, or `env`: every one of them must equal `Config.Environment`, and a canonical-but-different value (`prod` configured, `env=dev` overridden) is refused too.
 
 ## Quick start
 
@@ -131,6 +131,16 @@ re-checked for the same reason:
 
 ```
 telemetry: resource deployment.environment "production" is not canonical; use one of dev, sandbox, preprod, prod, and set it through Config.Environment rather than ExtraResourceAttributes (JIN-1570)
+```
+
+Every environment attribute on the merged resource (`deployment.environment`,
+`deployment.environment.name`, `env`) must equal `Config.Environment`. A
+canonical but different value is refused too — `Environment: "prod"` next to an
+override of `env="dev"` is still canonical, but it files production spans under
+`dev` and leaves the resource contradicting itself:
+
+```
+telemetry: resource env "dev" disagrees with Config.Environment "prod"; every environment attribute on the merged resource must carry the configured env — set it through Config.Environment rather than ExtraResourceAttributes (JIN-1570)
 ```
 
 The values are exported as constants for use in service config code:
