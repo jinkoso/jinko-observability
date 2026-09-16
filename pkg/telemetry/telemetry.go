@@ -27,6 +27,7 @@ import (
 
 	"go.opentelemetry.io/contrib/processors/baggagecopy"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
@@ -46,6 +47,9 @@ type Config struct {
 	ServiceVersion string
 
 	// Environment populates OTel deployment.environment and Datadog "env".
+	// Must be one of the canonical values in conventions.Environments —
+	// "dev", "sandbox", "preprod", "prod" (JIN-1570). Region and cluster
+	// belong in host/cluster tags, not here.
 	Environment string
 
 	// OTLPEndpoint is the gRPC endpoint of the Datadog Agent OTLP receiver
@@ -74,6 +78,12 @@ type Config struct {
 	// Resource attributes appended on top of the defaults built from
 	// ServiceName/ServiceVersion/Environment. Use for service.namespace,
 	// host.name, etc.
+	//
+	// These are appended LAST, so they override the defaults — with one
+	// exception: deployment.environment and env stay under the canonical
+	// vocabulary check (JIN-1570). buildResource re-checks the merged
+	// resource and fails, rather than let an override slip a value past
+	// validate. Setting the environment belongs in Environment above.
 	ExtraResourceAttributes []sdkresource.Option
 }
 
@@ -146,8 +156,17 @@ func (c Config) validate() error {
 	if c.Environment == "" {
 		// Required for Datadog Unified Service Tagging. Failing fast here
 		// prevents prod from silently shipping traces without the `env`
-		// tag, which would mix prod/staging/dev together in APM.
-		return errors.New("telemetry: Environment is required (e.g. \"production\", \"staging\", \"dev\")")
+		// tag, which would mix prod/preprod/dev together in APM.
+		return fmt.Errorf("telemetry: Environment is required (one of %s)",
+			strings.Join(conventions.Environments, ", "))
+	}
+	if !conventions.IsCanonicalEnvironment(c.Environment) {
+		// A non-canonical value is worse than a missing one: the service ships
+		// traces under an env nobody queries ("production", "prod-us"), so its
+		// spans are absent from every estate-wide dashboard and monitor while
+		// looking perfectly healthy locally.
+		return fmt.Errorf("telemetry: Environment %q is not canonical; use one of %s (JIN-1570)",
+			c.Environment, strings.Join(conventions.Environments, ", "))
 	}
 	if c.OTLPEndpoint == "" {
 		return errors.New("telemetry: OTLPEndpoint is required")
@@ -173,7 +192,74 @@ func buildResource(ctx context.Context, cfg Config) (*sdkresource.Resource, erro
 	}
 	attrs = append(attrs, cfg.ExtraResourceAttributes...)
 
-	return sdkresource.New(ctx, attrs...)
+	res, err := sdkresource.New(ctx, attrs...)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateResourceEnvironment(res, cfg.Environment); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// environmentResourceKeys are the resource attributes that become the Datadog
+// `env` tag: the OTel semantic-convention key, its newer spelling, and the
+// literal key Datadog Unified Service Tagging reads when a caller sets it
+// directly.
+//
+// deployment.environment.name is the semconv >= v1.27 rename of
+// deployment.environment. This module pins v1.26.0, so buildResource never
+// writes it, but the Datadog OTLP intake maps it onto the same `env` tag —
+// a caller can retag the resource through it just as effectively, so the
+// check must not be one attribute rename away from being bypassed.
+var environmentResourceKeys = map[attribute.Key]bool{
+	semconv.DeploymentEnvironmentKey:             true,
+	attribute.Key("deployment.environment.name"): true,
+	attribute.Key("env"):                         true,
+}
+
+// validateResourceEnvironment re-applies the env check to the MERGED resource,
+// against the env the service was actually configured with. Config.validate
+// only sees cfg.Environment, but ExtraResourceAttributes are appended after
+// deployment.environment in buildResource, so a caller could overwrite the env
+// tag on the resource that actually ships (JIN-1570).
+//
+// Every environment attribute on the merged resource must EQUAL configured.
+// Canonical membership alone is not enough: a prod service whose override says
+// env="dev" is still canonical, yet its spans land under an env nobody queries
+// for prod, and the merged resource can contradict itself
+// (deployment.environment="prod" beside env="dev"). Both checks are kept — the
+// vocabulary one reports the estate-wide mistake ("production", "prod-us") with
+// the list of allowed values, and it also covers the case where configured
+// itself is off-vocabulary because the caller skipped Config.validate.
+//
+// An empty value is refused like any other disagreeing one. Skipping it would
+// reopen the same hole from the other side: ExtraResourceAttributes are
+// appended after deployment.environment, so deployment.environment="" does not
+// leave the attribute absent — it overwrites the validated value, shipping
+// spans tagged env:"" . Config.validate refuses the empty string for the same
+// reason. An attribute nobody set is absent from the merged resource, so this
+// loop never sees it and never reports it — buildResource writes
+// deployment.environment only when cfg.Environment is non-empty.
+func validateResourceEnvironment(res *sdkresource.Resource, configured string) error {
+	if res == nil {
+		return nil
+	}
+	for _, kv := range res.Attributes() {
+		if !environmentResourceKeys[kv.Key] {
+			continue
+		}
+		value := kv.Value.Emit()
+		if !conventions.IsCanonicalEnvironment(value) {
+			return fmt.Errorf("telemetry: resource %s %q is not canonical; use one of %s, and set it through Config.Environment rather than ExtraResourceAttributes (JIN-1570)",
+				kv.Key, value, strings.Join(conventions.Environments, ", "))
+		}
+		if value != configured {
+			return fmt.Errorf("telemetry: resource %s %q disagrees with Config.Environment %q; every environment attribute on the merged resource must carry the configured env — set it through Config.Environment rather than ExtraResourceAttributes (JIN-1570)",
+				kv.Key, value, configured)
+		}
+	}
+	return nil
 }
 
 func buildTraceExporter(ctx context.Context, cfg Config) (sdktrace.SpanExporter, error) {

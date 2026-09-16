@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/jinkoso/jinko-observability/pkg/conventions"
 	"github.com/jinkoso/jinko-observability/pkg/telemetry"
 
 	"github.com/stretchr/testify/assert"
@@ -56,7 +57,7 @@ func TestInit_DisabledStillRegistersPropagator(t *testing.T) {
 func TestInit_EnabledRequiresServiceName(t *testing.T) {
 	_, err := telemetry.Init(context.Background(), telemetry.Config{
 		Enabled:      true,
-		Environment:  "test",
+		Environment:  conventions.EnvDev,
 		OTLPEndpoint: "localhost:4317",
 		Insecure:     true,
 	})
@@ -66,7 +67,7 @@ func TestInit_EnabledRequiresServiceName(t *testing.T) {
 
 func TestInit_EnabledRequiresEnvironment(t *testing.T) {
 	// Datadog Unified Service Tagging requires `env`. Without it, prod
-	// traces silently land in the same APM bucket as staging/dev, which
+	// traces silently land in the same APM bucket as preprod/dev, which
 	// is far worse than failing fast at startup.
 	_, err := telemetry.Init(context.Background(), telemetry.Config{
 		Enabled:      true,
@@ -82,8 +83,51 @@ func TestInit_EnabledRequiresOTLPEndpoint(t *testing.T) {
 	_, err := telemetry.Init(context.Background(), telemetry.Config{
 		Enabled:     true,
 		ServiceName: "test",
-		Environment: "test",
+		Environment: conventions.EnvDev,
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "OTLPEndpoint")
+}
+
+func TestInit_EnabledRejectsNonCanonicalEnvironment(t *testing.T) {
+	// JIN-1570: dev / sandbox / preprod / prod is the whole estate vocabulary.
+	// Anything else ships spans under an env no dashboard or monitor queries,
+	// so validation must fail at startup rather than at investigation time.
+	// Every config below is otherwise complete — only Environment is wrong.
+	for _, env := range []string{"production", "prod-us", "staging", "PROD"} {
+		t.Run(env, func(t *testing.T) {
+			_, err := telemetry.Init(context.Background(), telemetry.Config{
+				Enabled:      true,
+				ServiceName:  "test",
+				Environment:  env,
+				OTLPEndpoint: "localhost:4317",
+				Insecure:     true,
+			})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "not canonical")
+			assert.Contains(t, err.Error(), env)
+			assert.Contains(t, err.Error(), "dev, sandbox, preprod, prod")
+		})
+	}
+}
+
+func TestInit_EnabledAcceptsCanonicalEnvironments(t *testing.T) {
+	// Validation only. OTLPEndpoint is left empty on purpose so Init fails at
+	// the next check and never builds an exporter — same trick as
+	// TestInit_EnabledRequiresOTLPEndpoint, which keeps the test off the
+	// network and out of the global TracerProvider.
+	for _, env := range conventions.Environments {
+		t.Run(env, func(t *testing.T) {
+			_, err := telemetry.Init(context.Background(), telemetry.Config{
+				Enabled:     true,
+				ServiceName: "test",
+				Environment: env,
+			})
+			require.Error(t, err, "expected the OTLPEndpoint check to be reached")
+			assert.Contains(t, err.Error(), "OTLPEndpoint",
+				"canonical env %q must pass validation", env)
+			assert.NotContains(t, err.Error(), "canonical",
+				"canonical env %q must not be rejected as non-canonical", env)
+		})
+	}
 }
